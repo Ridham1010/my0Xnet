@@ -37,16 +37,24 @@ func NewSessionDiscovery(deviceID string) *SessionDiscovery {
 
 // StartDiscovery continuously discovers devices on the LAN
 func (sd *SessionDiscovery) StartDiscovery() {
+	log.Printf("Starting device discovery for device %s", sd.localDeviceID)
+	// Run initial discovery immediately
+	sd.discoverDevices()
+	
 	go func() {
-		for {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		
+		for range ticker.C {
 			sd.discoverDevices()
-			time.Sleep(10 * time.Second) // Rediscover every 10 seconds
 		}
 	}()
 }
 
 // discoverDevices finds all 0Xnet devices on the LAN using mDNS
 func (sd *SessionDiscovery) discoverDevices() {
+	log.Println("Starting mDNS device discovery...")
+	
 	resolver, err := zeroconf.NewResolver(nil)
 	if err != nil {
 		log.Println("Failed to initialize resolver:", err)
@@ -54,9 +62,11 @@ func (sd *SessionDiscovery) discoverDevices() {
 	}
 
 	entries := make(chan *zeroconf.ServiceEntry)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// Increased timeout to 5 seconds for better network compatibility
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	discoveredCount := 0
 	go func() {
 		for entry := range entries {
 			// Extract device ID from TXT records
@@ -70,6 +80,7 @@ func (sd *SessionDiscovery) discoverDevices() {
 
 			// Don't add ourselves
 			if deviceID == sd.localDeviceID {
+				log.Printf("Skipping self-discovery (deviceID: %s)", deviceID)
 				continue
 			}
 
@@ -81,7 +92,10 @@ func (sd *SessionDiscovery) discoverDevices() {
 					Port:     entry.Port,
 				}
 				sd.mutex.Unlock()
-				log.Printf("Discovered device: %s at %s:%d\n", deviceID, entry.AddrIPv4[0], entry.Port)
+				discoveredCount++
+				log.Printf("✓ Discovered device: %s at %s:%d", deviceID, entry.AddrIPv4[0], entry.Port)
+			} else {
+				log.Printf("Ignoring incomplete entry: deviceID=%s, addrs=%v", deviceID, entry.AddrIPv4)
 			}
 		}
 	}()
@@ -92,6 +106,20 @@ func (sd *SessionDiscovery) discoverDevices() {
 	}
 
 	<-ctx.Done()
+	
+	log.Printf("Discovery complete. Found %d device(s)", discoveredCount)
+	
+	// Log current device list
+	sd.mutex.RLock()
+	if len(sd.devices) > 0 {
+		log.Println("Current discovered devices:")
+		for id, device := range sd.devices {
+			log.Printf("  - %s at %s:%d", id, device.Address, device.Port)
+		}
+	} else {
+		log.Println("No other devices discovered on the network")
+	}
+	sd.mutex.RUnlock()
 }
 
 // GetAllSessions fetches sessions from all discovered devices
@@ -119,7 +147,14 @@ func (sd *SessionDiscovery) GetAllSessions(localSessions []models.Session) []mod
 
 // fetchSessionsFromDevice fetches sessions from a specific device
 func (sd *SessionDiscovery) fetchSessionsFromDevice(device *DiscoveredDevice) []models.Session {
-	url := fmt.Sprintf("http://%s:%d/session/list", device.Address, device.Port)
+	// Try localhost first if the address looks like it might be a local address
+	// This helps with same-machine testing
+	address := device.Address
+	if address == "172.31.52.30" || address == "127.0.0.1" {
+		address = "localhost"
+	}
+	
+	url := fmt.Sprintf("http://%s:%d/session/list", address, device.Port)
 	
 	client := &http.Client{
 		Timeout: 2 * time.Second,
@@ -127,8 +162,18 @@ func (sd *SessionDiscovery) fetchSessionsFromDevice(device *DiscoveredDevice) []
 	
 	resp, err := client.Get(url)
 	if err != nil {
-		log.Printf("Failed to fetch sessions from %s: %v\n", device.DeviceID, err)
-		return nil
+		// If localhost didn't work, try the original address
+		if address == "localhost" {
+			url = fmt.Sprintf("http://%s:%d/session/list", device.Address, device.Port)
+			resp, err = client.Get(url)
+			if err != nil {
+				log.Printf("Failed to fetch sessions from %s: %v\n", device.DeviceID, err)
+				return nil
+			}
+		} else {
+			log.Printf("Failed to fetch sessions from %s: %v\n", device.DeviceID, err)
+			return nil
+		}
 	}
 	defer resp.Body.Close()
 
