@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,19 +15,24 @@ import (
 	"github.com/bhawani-prajapat2006/0Xnet/backend/internal/db"
 	"github.com/bhawani-prajapat2006/0Xnet/backend/internal/discovery"
 	httpapi "github.com/bhawani-prajapat2006/0Xnet/backend/internal/http"
-	"github.com/bhawani-prajapat2006/0Xnet/backend/internal/service"
+	"github.com/bhawani-prajapat2006/0Xnet/backend/internal/identity"
+	"github.com/bhawani-prajapat2006/0Xnet/backend/internal/relay"
+	"github.com/bhawani-prajapat2006/0Xnet/backend/internal/transport"
 
+	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
-	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
-	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
-	"github.com/libp2p/go-libp2p/p2p/transport/websocket"
-	"github.com/multiformats/go-multiaddr"
 )
+
+// getLocalIP returns the device's local IP address on the network
+func getLocalIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "localhost"
+	}
+	defer conn.Close()
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
+}
 
 func main() {
 	godotenv.Load()
@@ -35,33 +42,8 @@ func main() {
 		log.Fatal("Database connection failed:", err)
 	}
 
-	relayAddrStr := os.Getenv("RELAY_ADDR")
-	if relayAddrStr == "" {
-		log.Fatal("RELAY_ADDR not found in .env")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Initialize host with Identity (Private Key)
-	h, relayPeerID, err := initLibp2pHost(ctx, relayAddrStr)
-	if err != nil {
-		log.Fatal("Failed to initialize libp2p: ", err)
-	}
-	defer h.Close()
-
-	deviceID := h.ID().String()
-	log.Printf("🚀 Starting 0Xnet | PeerID: %s", deviceID)
-
-	sessionDiscovery := discovery.NewSessionDiscovery(h, relayPeerID)
-	sessionDiscovery.StartDiscovery()
-
-	// Protocol for syncing sessions between peers
-	h.SetStreamHandler("/0xnet/session-sync/1.0.0", func(s network.Stream) {
-		log.Printf("📥 Incoming session sync request from: %s", s.Conn().RemotePeer())
-		localSessions, _ := service.ListSessions(dbConn)
-		discovery.HandleIncomingSessionRequest(s, localSessions)
-	})
+	deviceID := identity.NewDeviceID()
+	localIP := getLocalIP()
 
 	port := 8080
 	if pStr := os.Getenv("PORT"); pStr != "" {
@@ -70,68 +52,128 @@ func main() {
 		}
 	}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Auto-discover relay via mDNS
+	host, relayPort := discovery.FindRelay()
+
+	var sessionDiscovery = discovery.NewLocalSessionDiscovery(deviceID)
+
+	if host == "" {
+		// No relay found -> become relay
+		log.Println("╔════════════════════════════════════════╗")
+		log.Println("║  🚀 0Xnet RELAY MODE ACTIVATED        ║")
+		log.Println("╚════════════════════════════════════════╝")
+		log.Printf("📱 Device ID: %s", deviceID[:12]+"...")
+		log.Printf("🌐 Local IP: %s", localIP)
+		log.Printf("📡 Relay WS: ws://%s:9090/relay-ws", localIP)
+		log.Printf("🌍 API URL:  http://%s:%d", localIP, port)
+		log.Println("")
+
+		hub := relay.NewHub()
+
+		go discovery.Advertise(ctx, 9090, deviceID)
+
+		http.HandleFunc("/relay-ws", func(w http.ResponseWriter, r *http.Request) {
+			conn, _ := transport.Upgrader.Upgrade(w, r, nil)
+
+			_, msg, _ := conn.ReadMessage()
+			id := string(msg)
+
+			hub.Register(id, conn)
+
+			log.Printf("✅ Device joined: %s", id[:12]+"...")
+
+			for {
+				_, data, err := conn.ReadMessage()
+				if err != nil {
+					hub.Remove(id)
+					log.Printf("❌ Device left: %s", id[:12]+"...")
+					break
+				}
+				hub.Broadcast(id, data)
+			}
+		})
+
+		// Start API using local discovery
+		go func() {
+			server := httpapi.NewServer(dbConn, deviceID, sessionDiscovery, port)
+			server.Start()
+		}()
+
+		log.Println("✨ Relay running on :9090")
+		log.Println("✨ API running on :" + fmt.Sprint(port))
+		log.Println("")
+		log.Println("📱 Access from other devices:")
+		log.Printf("   → http://%s:%d/devices", localIP, port)
+		log.Println("")
+
+		// Blocking: run relay http for websocket relay
+		if err := http.ListenAndServe(":9090", nil); err != nil {
+			log.Fatal(err)
+		}
+
+	} else {
+		// Relay found -> act as client
+		log.Println("╔════════════════════════════════════════╗")
+		log.Println("║  🔗 0Xnet CLIENT MODE ACTIVATED       ║")
+		log.Println("╚════════════════════════════════════════╝")
+		log.Printf("📱 Device ID: %s", deviceID[:12]+"...")
+		log.Printf("🌐 Local IP: %s", localIP)
+		log.Printf("📡 Connecting to relay: ws://%s:%d/relay-ws", host, relayPort)
+		log.Println("")
+
+		url := fmt.Sprintf("ws://%s:%d/relay-ws", host, relayPort)
+
+		var conn *websocket.Conn
+		for i := 1; i <= 10; i++ {
+			connDial, _, err := websocket.DefaultDialer.Dial(url, nil)
+			if err == nil {
+				conn = connDial
+				break
+			}
+			log.Printf("⏳ Attempt %d: Retrying relay connection...", i)
+			time.Sleep(2 * time.Second)
+		}
+
+		if conn == nil {
+			log.Fatal("❌ Failed to connect to relay after 10 attempts")
+		}
+
+		// Send deviceID as first message
+		conn.WriteMessage(websocket.TextMessage, []byte(deviceID))
+
+		log.Println("✅ Connected to relay!")
+		log.Printf("🌍 API URL:  http://%s:%d", localIP, port)
+		log.Println("")
+		log.Println("📱 Access from other devices:")
+		log.Printf("   → http://%s:%d/devices", localIP, port)
+		log.Println("")
+
+		// Start API using local discovery (limited)
+		go func() {
+			server := httpapi.NewServer(dbConn, deviceID, sessionDiscovery, port)
+			server.Start()
+		}()
+
+		// Keep reading messages from relay (application-specific handling can be added)
+		go func() {
+			for {
+				_, msg, err := conn.ReadMessage()
+				if err != nil {
+					log.Println("❌ Relay connection lost:", err)
+					os.Exit(1)
+				}
+				log.Println("📨 Relay message:", string(msg))
+			}
+		}()
+
+		// Keep main alive until signal
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 		<-sigChan
 		cancel()
 		os.Exit(0)
-	}()
-
-	server := httpapi.NewServer(dbConn, deviceID, sessionDiscovery, port)
-	server.Start()
-}
-
-func initLibp2pHost(ctx context.Context, relayAddr string) (host.Host, peer.ID, error) {
-	// Load Identity from .env
-	var privKey crypto.PrivKey
-	if privKeyStr := os.Getenv("PRIVATE_KEY"); privKeyStr != "" {
-		keyBytes, err := crypto.ConfigDecodeKey(privKeyStr)
-		if err != nil {
-			log.Printf("⚠️ Invalid PRIVATE_KEY format: %v", err)
-		} else {
-			privKey, _ = crypto.UnmarshalPrivateKey(keyBytes)
-		}
 	}
-
-	opts := []libp2p.Option{
-		libp2p.ChainOptions(
-			libp2p.Transport(tcp.NewTCPTransport),
-			libp2p.Transport(websocket.New),
-		),
-		libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"),
-		libp2p.EnableRelay(),
-	}
-
-	if privKey != nil {
-		opts = append(opts, libp2p.Identity(privKey))
-	}
-
-	h, err := libp2p.New(opts...)
-	if err != nil {
-		return nil, "", err
-	}
-
-	ma, _ := multiaddr.NewMultiaddr(relayAddr)
-	relayInfo, _ := peer.AddrInfoFromP2pAddr(ma)
-
-	if err := h.Connect(ctx, *relayInfo); err != nil {
-		return nil, "", fmt.Errorf("relay connection failed: %w", err)
-	}
-
-	log.Println("⌛ Connection established. Stabilizing...")
-	time.Sleep(5 * time.Second)
-
-	// Reserve slot on the Relay
-	for i := 1; i <= 5; i++ {
-		reservation, err := client.Reserve(ctx, h, *relayInfo)
-		if err == nil {
-			log.Printf("✅ SUCCESS! Reserved slot until: %s", reservation.Expiration)
-			return h, relayInfo.ID, nil
-		}
-		log.Printf("⚠️ Attempt %d: Reservation failed (%v). Retrying...", i, err)
-		time.Sleep(5 * time.Second)
-	}
-
-	return nil, "", fmt.Errorf("relay reservation failed")
 }

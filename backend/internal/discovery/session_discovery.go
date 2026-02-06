@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/bhawani-prajapat2006/0Xnet/backend/internal/models"
-	"github.com/libp2p/go-libp2p-kad-dht"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -27,6 +27,8 @@ type SessionDiscovery struct {
 	mutex         sync.RWMutex
 	dht           *dht.IpfsDHT
 	relayPeer     peer.ID
+	// localDevices holds devices registered via HTTP or non-libp2p clients
+	localDevices map[string]*DiscoveredDevice
 }
 
 func NewSessionDiscovery(h host.Host, relayPeerID peer.ID) *SessionDiscovery {
@@ -41,21 +43,18 @@ func NewSessionDiscovery(h host.Host, relayPeerID peer.ID) *SessionDiscovery {
 		devices:       make(map[peer.ID]*DiscoveredDevice),
 		dht:           kademliaDHT,
 		relayPeer:     relayPeerID,
+		localDevices:  make(map[string]*DiscoveredDevice),
 	}
 }
 
 func (sd *SessionDiscovery) StartDiscovery() {
 	ctx := context.Background()
 
-	// 1. Seed the DHT with the relay
-	if sd.relayPeer != "" {
-		if err := sd.dht.ConnectBootstrap(ctx, sd.relayPeer); err != nil {
-			log.Printf("⚠️ DHT Seeding failed: %v", err)
+	// Bootstrap DHT (standard bootstrap)
+	if sd.dht != nil {
+		if err := sd.dht.Bootstrap(ctx); err != nil {
+			log.Printf("⚠️ DHT Bootstrap error: %v", err)
 		}
-	}
-
-	if err := sd.dht.Bootstrap(ctx); err != nil {
-		log.Printf("⚠️ DHT Bootstrap error: %v", err)
 	}
 
 	// 2. Track real-time connections via Notifier
@@ -82,7 +81,7 @@ func (sd *SessionDiscovery) StartDiscovery() {
 	// 3. Background Discovery Loop
 	go func() {
 		routingDiscovery := routing.NewRoutingDiscovery(sd.dht)
-		
+
 		// Advertising
 		go func() {
 			for {
@@ -117,7 +116,18 @@ func (sd *SessionDiscovery) GetDiscoveredDevices() []*DiscoveredDevice {
 	for _, d := range sd.devices {
 		list = append(list, d)
 	}
+	// include local HTTP-registered devices
+	for _, d := range sd.localDevices {
+		list = append(list, d)
+	}
 	return list
+}
+
+// RegisterDevice registers a device that calls the HTTP API (e.g. a phone in browser)
+func (sd *SessionDiscovery) RegisterDevice(id string) {
+	sd.mutex.Lock()
+	defer sd.mutex.Unlock()
+	sd.localDevices[id] = &DiscoveredDevice{DeviceID: id}
 }
 
 // HandleIncomingSessionRequest is the responder for when OTHER peers call you
