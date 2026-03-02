@@ -3,160 +3,181 @@ package discovery
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"sync"
 	"time"
 
 	"github.com/bhawani-prajapat2006/0Xnet/backend/internal/models"
-	"github.com/grandcat/zeroconf"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
+	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 )
 
-// DiscoveredDevice represents a device found on the LAN
 type DiscoveredDevice struct {
-	DeviceID string
-	Address  string
-	Port     int
+	DeviceID string `json:"device_id"`
 }
 
-// SessionDiscovery manages session discovery across the LAN
 type SessionDiscovery struct {
+	host          host.Host
 	localDeviceID string
-	devices       map[string]*DiscoveredDevice
+	devices       map[peer.ID]*DiscoveredDevice
 	mutex         sync.RWMutex
+	dht           *dht.IpfsDHT
+	relayPeer     peer.ID
+	// localDevices holds devices registered via HTTP or non-libp2p clients
+	localDevices map[string]*DiscoveredDevice
 }
 
-func NewSessionDiscovery(deviceID string) *SessionDiscovery {
+func NewSessionDiscovery(h host.Host, relayPeerID peer.ID) *SessionDiscovery {
+	kademliaDHT, err := dht.New(context.Background(), h, dht.Mode(dht.ModeClient))
+	if err != nil {
+		log.Printf("❌ Failed to create DHT: %v", err)
+	}
+
 	return &SessionDiscovery{
-		localDeviceID: deviceID,
-		devices:       make(map[string]*DiscoveredDevice),
+		host:          h,
+		localDeviceID: h.ID().String(),
+		devices:       make(map[peer.ID]*DiscoveredDevice),
+		dht:           kademliaDHT,
+		relayPeer:     relayPeerID,
+		localDevices:  make(map[string]*DiscoveredDevice),
 	}
 }
 
-// StartDiscovery continuously discovers devices on the LAN
 func (sd *SessionDiscovery) StartDiscovery() {
+	ctx := context.Background()
+
+	// Bootstrap DHT (standard bootstrap)
+	if sd.dht != nil {
+		if err := sd.dht.Bootstrap(ctx); err != nil {
+			log.Printf("⚠️ DHT Bootstrap error: %v", err)
+		}
+	}
+
+	// 2. Track real-time connections via Notifier
+	sd.host.Network().Notify(&network.NotifyBundle{
+		ConnectedF: func(n network.Network, conn network.Conn) {
+			pID := conn.RemotePeer()
+			if pID == sd.host.ID() || pID == sd.relayPeer {
+				return
+			}
+			sd.mutex.Lock()
+			sd.devices[pID] = &DiscoveredDevice{DeviceID: pID.String()}
+			sd.mutex.Unlock()
+			log.Printf("✅ Peer Connected & Tracked: %s", pID.String()[:12])
+		},
+		DisconnectedF: func(n network.Network, conn network.Conn) {
+			pID := conn.RemotePeer()
+			sd.mutex.Lock()
+			delete(sd.devices, pID)
+			sd.mutex.Unlock()
+			log.Printf("❌ Peer Disconnected: %s", pID.String()[:12])
+		},
+	})
+
+	// 3. Background Discovery Loop
 	go func() {
+		routingDiscovery := routing.NewRoutingDiscovery(sd.dht)
+
+		// Advertising
+		go func() {
+			for {
+				util.Advertise(ctx, routingDiscovery, "0xnet-global-v1")
+				time.Sleep(30 * time.Second)
+			}
+		}()
+
+		// Searching
 		for {
-			sd.discoverDevices()
-			time.Sleep(10 * time.Second) // Rediscover every 10 seconds
+			peerChan, err := routingDiscovery.FindPeers(ctx, "0xnet-global-v1")
+			if err == nil {
+				for p := range peerChan {
+					if p.ID == sd.host.ID() || p.ID == "" || p.ID == sd.relayPeer {
+						continue
+					}
+					sd.host.Connect(ctx, p)
+				}
+			}
+			time.Sleep(20 * time.Second)
 		}
 	}()
 }
 
-// discoverDevices finds all 0Xnet devices on the LAN using mDNS
-func (sd *SessionDiscovery) discoverDevices() {
-	resolver, err := zeroconf.NewResolver(nil)
-	if err != nil {
-		log.Println("Failed to initialize resolver:", err)
-		return
-	}
+// --- API & SYNC FUNCTIONS ---
 
-	entries := make(chan *zeroconf.ServiceEntry)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	go func() {
-		for entry := range entries {
-			// Extract device ID from TXT records
-			deviceID := ""
-			for _, txt := range entry.Text {
-				if len(txt) > 9 && txt[:9] == "deviceId=" {
-					deviceID = txt[9:]
-					break
-				}
-			}
-
-			// Don't add ourselves
-			if deviceID == sd.localDeviceID {
-				continue
-			}
-
-			if deviceID != "" && len(entry.AddrIPv4) > 0 {
-				sd.mutex.Lock()
-				sd.devices[deviceID] = &DiscoveredDevice{
-					DeviceID: deviceID,
-					Address:  entry.AddrIPv4[0].String(),
-					Port:     entry.Port,
-				}
-				sd.mutex.Unlock()
-				log.Printf("Discovered device: %s at %s:%d\n", deviceID, entry.AddrIPv4[0], entry.Port)
-			}
-		}
-	}()
-
-	err = resolver.Browse(ctx, "_0xnet._tcp", "local.", entries)
-	if err != nil {
-		log.Println("Failed to browse:", err)
-	}
-
-	<-ctx.Done()
-}
-
-// GetAllSessions fetches sessions from all discovered devices
-func (sd *SessionDiscovery) GetAllSessions(localSessions []models.Session) []models.Session {
-	allSessions := make([]models.Session, 0)
-	
-	// Add local sessions
-	allSessions = append(allSessions, localSessions...)
-
-	sd.mutex.RLock()
-	devices := make([]*DiscoveredDevice, 0, len(sd.devices))
-	for _, device := range sd.devices {
-		devices = append(devices, device)
-	}
-	sd.mutex.RUnlock()
-
-	// Fetch sessions from each discovered device
-	for _, device := range devices {
-		sessions := sd.fetchSessionsFromDevice(device)
-		allSessions = append(allSessions, sessions...)
-	}
-
-	return allSessions
-}
-
-// fetchSessionsFromDevice fetches sessions from a specific device
-func (sd *SessionDiscovery) fetchSessionsFromDevice(device *DiscoveredDevice) []models.Session {
-	url := fmt.Sprintf("http://%s:%d/session/list", device.Address, device.Port)
-	
-	client := &http.Client{
-		Timeout: 2 * time.Second,
-	}
-	
-	resp, err := client.Get(url)
-	if err != nil {
-		log.Printf("Failed to fetch sessions from %s: %v\n", device.DeviceID, err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil
-	}
-
-	var sessions []models.Session
-	if err := json.Unmarshal(body, &sessions); err != nil {
-		return nil
-	}
-
-	return sessions
-}
-
-// GetDiscoveredDevices returns the list of discovered devices
+// GetDiscoveredDevices returns the list for the /devices endpoint
 func (sd *SessionDiscovery) GetDiscoveredDevices() []*DiscoveredDevice {
 	sd.mutex.RLock()
 	defer sd.mutex.RUnlock()
-
-	devices := make([]*DiscoveredDevice, 0, len(sd.devices))
-	for _, device := range sd.devices {
-		devices = append(devices, device)
+	list := make([]*DiscoveredDevice, 0, len(sd.devices))
+	for _, d := range sd.devices {
+		list = append(list, d)
 	}
-	return devices
+	// include local HTTP-registered devices
+	for _, d := range sd.localDevices {
+		list = append(list, d)
+	}
+	return list
+}
+
+// RegisterDevice registers a device that calls the HTTP API (e.g. a phone in browser)
+func (sd *SessionDiscovery) RegisterDevice(id string) {
+	sd.mutex.Lock()
+	defer sd.mutex.Unlock()
+	sd.localDevices[id] = &DiscoveredDevice{DeviceID: id}
+}
+
+// HandleIncomingSessionRequest is the responder for when OTHER peers call you
+func HandleIncomingSessionRequest(s network.Stream, sessions []models.Session) {
+	defer s.Close()
+	if err := json.NewEncoder(s).Encode(sessions); err != nil {
+		log.Printf("Error sending sessions to peer: %v", err)
+	}
+}
+
+// FetchSessionsFromPeer is the requester that YOU use to pull data from a specific peer
+func (sd *SessionDiscovery) FetchSessionsFromPeer(pID peer.ID) ([]models.Session, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Open a new stream using the protocol ID we defined in main.go
+	stream, err := sd.host.NewStream(ctx, pID, "/0xnet/session-sync/1.0.0")
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+
+	var sessions []models.Session
+	if err := json.NewDecoder(stream).Decode(&sessions); err != nil {
+		return nil, err
+	}
+
+	return sessions, nil
+}
+
+// GetAllSessions combines local and remote data (The big picture function)
+func (sd *SessionDiscovery) GetAllSessions(localSessions []models.Session) []models.Session {
+	sd.mutex.RLock()
+	peersToSync := make([]peer.ID, 0, len(sd.devices))
+	for pID := range sd.devices {
+		peersToSync = append(peersToSync, pID)
+	}
+	sd.mutex.RUnlock()
+
+	allSessions := localSessions
+
+	// Iterate through all discovered peers and pull their data
+	for _, pID := range peersToSync {
+		remoteSessions, err := sd.FetchSessionsFromPeer(pID)
+		if err != nil {
+			log.Printf("⚠️ Failed to sync with %s: %v", pID, err)
+			continue
+		}
+		allSessions = append(allSessions, remoteSessions...)
+	}
+
+	return allSessions
 }
