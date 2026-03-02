@@ -14,9 +14,9 @@ import (
 
 func main() {
 	deviceID := uuid.New().String()
-	
+
 	// Get port from environment variable, default to 8080
-	port := 8080
+	port := 443
 	if portStr := os.Getenv("PORT"); portStr != "" {
 		if p, err := strconv.Atoi(portStr); err == nil {
 			port = p
@@ -38,4 +38,6 @@ func main() {
 	server := httpapi.NewServer(dbConn, deviceID, sessionDiscovery, port)
 	log.Printf("0Xnet running on port %d\n", port)
 	server.Start()
+	for {
+	}
 }

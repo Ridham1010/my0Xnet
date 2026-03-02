@@ -14,6 +14,7 @@ import (
 	"github.com/grandcat/zeroconf"
 )
 
+
 // DiscoveredDevice represents a device found on the LAN
 type DiscoveredDevice struct {
 	DeviceID string
